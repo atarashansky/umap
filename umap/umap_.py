@@ -1480,7 +1480,7 @@ class UMAP(BaseEstimator):
         if (self.unique == True) and (self.metric == "precomputed"):
             raise ValueError("unique is poorly defined on a precomputed metric")
 
-    def fit(self, X, y=None):
+    def fit(self, X, y=None, Z=None):
         """Fit X into an embedded space.
 
         Optionally use y for supervised dimension reduction.
@@ -1499,9 +1499,14 @@ class UMAP(BaseEstimator):
             The relevant attributes are ``target_metric`` and
             ``target_metric_kwds``.
         """
-
         X = check_array(X, dtype=np.float32, accept_sparse="csr", order="C")
         self._raw_data = X
+
+        if Z is None:
+            self.calculate_neighbors = True
+        else:
+            self._knn_indices,self._knn_dists = Z
+            self.calculate_neighbors = False
 
         # Handle all the optional arguments, setting default
         if self.a is None or self.b is None:
@@ -1529,8 +1534,10 @@ class UMAP(BaseEstimator):
 
         self._validate_parameters()
 
-        if self.metric is "hellinger" and X.min() < 0:
-            raise ValueError("Metric 'hellinger' does not support negative values")
+        if self.calculate_neighbors:
+            if self.metric == "hellinger" and X.min() < 0:
+                raise ValueError("Metric 'hellinger' does not"
+                                 "support negative values")
 
         if self.verbose:
             print(str(self))
@@ -1538,7 +1545,7 @@ class UMAP(BaseEstimator):
         # NEW CODE
         # Check if we should unique the data
         # We've already ensured that we aren't in the precomputed case
-        if self.unique:
+        if self.unique and self.calculate_neighbors:
             # check if the matrix is dense
             if scipy.sparse.isspmatrix_csr(X):
                 # Call a sparse unique function
@@ -1567,34 +1574,44 @@ class UMAP(BaseEstimator):
                 )
         # If we aren't asking for unique use the full index.
         # This will save special cases later.
-        else:
+        elif self.calculate_neighbors:
             index = list(range(X.shape[0]))
             inverse = list(range(X.shape[0]))
 
         # Error check n_neighbors based on data size
-        if X[index].shape[0] <= self.n_neighbors:
-            if X[index].shape[0] == 1:
-                self.embedding_ = np.zeros(
-                    (1, self.n_components)
-                )  # needed to sklearn comparability
-                return self
+        if self.calculate_neighbors:
+            if X[index].shape[0] <= self.n_neighbors:
+                if X[index].shape[0] == 1:
+                    self.embedding_ = np.zeros(
+                        (1, self.n_components)
+                    )  # needed to sklearn comparability
+                    return self
 
-            warn(
-                "n_neighbors is larger than the dataset size; truncating to "
-                "X.shape[0] - 1"
-            )
-            self._n_neighbors = X[index].shape[0] - 1
+                warn(
+                    "n_neighbors is larger than the dataset size; truncating to "
+                    "X.shape[0] - 1"
+                )
+                self._n_neighbors = X[index].shape[0] - 1
+            else:
+                self._n_neighbors = self.n_neighbors
         else:
-            self._n_neighbors = self.n_neighbors
+            self._n_neighbors = self._knn_dists.shape[1]
 
         # I could make the unique check a subcall of this...
         # probably less readable
-        if scipy.sparse.isspmatrix_csr(X):
-            if not X.has_sorted_indices:
-                X.sort_indices()
-            self._sparse_data = True
+        if self.calculate_neighbors:
+            if scipy.sparse.isspmatrix_csr(X):
+                if not X.has_sorted_indices:
+                    X.sort_indices()
+                self._sparse_data = True
+            else:
+                self._sparse_data = False
+
+            self._small_data = (X[index].shape[0] < 4096 and
+                                        not self.force_approximation_algorithm)
         else:
             self._sparse_data = False
+            self._small_data = False
 
         random_state = check_random_state(self.random_state)
 
@@ -1602,8 +1619,7 @@ class UMAP(BaseEstimator):
             print("Construct fuzzy simplicial set")
 
         # Handle small cases efficiently by computing all distances
-        if X[index].shape[0] < 4096 and not self.force_approximation_algorithm:
-            self._small_data = True
+        if self._small_data and self.calculate_neighbors:
             try:
                 dmat = pairwise_distances(
                     X[index], metric=self.metric, **self._metric_kwds
@@ -1632,19 +1648,21 @@ class UMAP(BaseEstimator):
                 self.verbose,
             )
         else:
-            self._small_data = False
             # Standard case
-            (self._knn_indices, self._knn_dists, self._rp_forest) = nearest_neighbors(
-                X[index],
-                self._n_neighbors,
-                self.metric,
-                self._metric_kwds,
-                self.angular_rp_forest,
-                random_state,
-                self.low_memory,
-                use_pynndescent=True,
-                verbose=self.verbose,
-            )
+            if self.calculate_neighbors:
+                (self._knn_indices, self._knn_dists, self._rp_forest) = nearest_neighbors(
+                    X[index],
+                    self._n_neighbors,
+                    self.metric,
+                    self._metric_kwds,
+                    self.angular_rp_forest,
+                    random_state,
+                    self.low_memory,
+                    use_pynndescent=True,
+                    verbose=self.verbose,
+                )
+            else:
+                self._rp_forest = {}
 
             self.graph_, self._sigmas, self._rhos = fuzzy_simplicial_set(
                 X[index],
@@ -1826,13 +1844,14 @@ class UMAP(BaseEstimator):
 
         return self
 
-    def fit_transform(self, X, y=None):
+    def fit_transform(self, X, y=None, Z=None):
         """Fit X into an embedded space and return that transformed
         output.
 
         Parameters
         ----------
         X : array, shape (n_samples, n_features) or (n_samples, n_samples)
+            or tuple (knn_indices, knn_distances)
             If the metric is 'precomputed' X must be a square distance
             matrix. Otherwise it contains a sample per row.
 
@@ -1847,7 +1866,7 @@ class UMAP(BaseEstimator):
         X_new : array, shape (n_samples, n_components)
             Embedding of the training data in low-dimensional space.
         """
-        self.fit(X, y)
+        self.fit(X, y, Z)
         return self.embedding_
 
     def transform(self, X):
